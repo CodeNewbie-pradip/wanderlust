@@ -1,0 +1,109 @@
+pipeline {
+  agent { label 'k8s' }
+
+  environment {
+    // Docker Hub credentials
+    DOCKER_HUB_CREDENTIALS = credentials('docker-credential')
+    DOCKER_USER = "${DOCKER_HUB_CREDENTIALS_USR}"
+    DOCKER_PASS = "${DOCKER_HUB_CREDENTIALS_PSW}"
+    IMAGE_FRONTEND = "wanderlust-frontend:v1"
+    IMAGE_BACKEND = "wanderlust-backend:v1"
+
+    // ArgoCD credentials
+    ARGOCD_CREDS = credentials('argocd-credentials')
+    ARGOCD_SERVER = 'https://52.66.239.170:8443' // Or your actual ArgoCD IP:PORT
+
+    // SonarQube config
+    SONARQUBE_ENV = 'sonar-scanner'
+    SONAR_PROJECT_KEY = 'wanderlust-mern'
+
+    // Git repo
+    GIT_REPO = 'https://github.com/Adityasirsam123/wanderlust.git'
+  }
+
+  stages {
+    stage('Git Clone') {
+      steps {
+        git url: "${env.GIT_REPO}", branch: 'main'
+      }
+    }
+
+    stage('SonarQube Code Scan') {
+      environment {
+        scannerHome = tool 'sonar-scanner'
+      }
+      steps {
+        withSonarQubeEnv("${SONARQUBE_ENV}") {
+          sh '''
+            ${scannerHome}/bin/sonar-scanner \
+              -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+              -Dsonar.sources=. \
+              -Dsonar.host.url=$SONAR_HOST_URL
+          '''
+        }
+      }
+    }
+
+    stage('Wait for Quality Gate') {
+      steps {
+        timeout(time: 15, unit: 'MINUTES') {
+          waitForQualityGate abortPipeline: false
+        }
+      }
+    }
+
+    stage('Build Docker Images') {
+      steps {
+        sh '''
+          docker build -t ${DOCKER_USER}/${IMAGE_FRONTEND} ./frontend
+          docker build -t ${DOCKER_USER}/${IMAGE_BACKEND} ./backend
+        '''
+      }
+    }
+
+    stage('Trivy Image Scan') {
+      steps {
+        sh '''
+          trivy image ${DOCKER_USER}/${IMAGE_FRONTEND}
+          trivy image ${DOCKER_USER}/${IMAGE_BACKEND}
+        '''
+      }
+    }
+
+    stage('Push Images to Docker Hub') {
+      steps {
+        sh '''
+          echo "${DOCKER_PASS}" | docker login -u "${DOCKER_USER}" --password-stdin
+          docker push ${DOCKER_USER}/${IMAGE_FRONTEND}
+          docker push ${DOCKER_USER}/${IMAGE_BACKEND}
+        '''
+      }
+    }
+
+    stage('Deploy via ArgoCD') {
+      agent {
+        docker {
+          image 'argoproj/argocd:latest'
+          args '-u root'
+        }
+      }
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'argocd-credentials', usernameVariable: 'ARGOCD_USER', passwordVariable: 'ARGOCD_PASS')]) {
+          sh '''
+            argocd login $ARGOCD_SERVER --username $ARGOCD_USER --password $ARGOCD_PASS --insecure
+            argocd app sync wanderlust
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    failure {
+      echo "Pipeline failed! Check logs."
+    }
+    success {
+      echo "Pipeline completed successfully!"
+    }
+  }
+}
